@@ -99,7 +99,7 @@ func (p *planner) CreateTable(ctx context.Context, n *tree.CreateTable) (planNod
 // createTableRun contains the run-time state of createTableNode
 // during local execution.
 type createTableRun struct {
-	count int
+	rowsAffected int
 }
 
 func (n *createTableNode) Start(params runParams) error {
@@ -225,8 +225,8 @@ func (n *createTableNode) Start(params runParams) error {
 		if err != nil {
 			return err
 		}
-		// Passing the affected rows num back.
-		n.run.count = count
+		// Return the number of rows affected as result.
+		n.run.rowsAffected = count
 	}
 	return nil
 }
@@ -239,6 +239,13 @@ func (n *createTableNode) Close(ctx context.Context) {
 		n.sourcePlan.Close(ctx)
 		n.sourcePlan = nil
 	}
+}
+
+func (n *createTableNode) FastPathResults() (int, bool) {
+	if n.n.As() {
+		return n.run.rowsAffected, true
+	}
+	return 0, false
 }
 
 // HoistConstraints finds column constraints defined inline with the columns
@@ -404,15 +411,22 @@ func resolveFK(
 		constraintName = fmt.Sprintf("fk_%s_ref_%s", string(d.FromCols[0]), target.Name)
 	}
 
-	var targetIdx *sqlbase.IndexDescriptor
+	// We can't keep a reference to the index in the slice and at the same time
+	// add a new index to that slice without losing the reference. Instead, keep
+	// the index's index into target's list of indexes. If it is a primary index,
+	// targetIdxIndex is set to -1. Also store the targetIndex's ID so we
+	// don't have to do the lookup twice.
+	targetIdxIndex := -1
+	var targetIdxID sqlbase.IndexID
 	if matchesIndex(targetCols, target.PrimaryIndex, matchExact) {
-		targetIdx = &target.PrimaryIndex
+		targetIdxID = target.PrimaryIndex.ID
 	} else {
 		found := false
 		// Find the index corresponding to the referenced column.
 		for i, idx := range target.Indexes {
 			if idx.Unique && matchesIndex(targetCols, idx, matchExact) {
-				targetIdx = &target.Indexes[i]
+				targetIdxIndex = i
+				targetIdxID = idx.ID
 				found = true
 				break
 			}
@@ -438,7 +452,7 @@ func resolveFK(
 	}
 	ref := sqlbase.ForeignKeyReference{
 		Table:           target.ID,
-		Index:           targetIdx.ID,
+		Index:           targetIdxID,
 		Name:            constraintName,
 		SharedPrefixLen: int32(len(srcCols)),
 		OnDelete:        sqlbase.ForeignKeyReferenceActionValue[d.Actions.Delete],
@@ -484,7 +498,11 @@ func resolveFK(
 			backref.Index = added
 		}
 	}
-	targetIdx.ReferencedBy = append(targetIdx.ReferencedBy, backref)
+	if targetIdxIndex > -1 {
+		target.Indexes[targetIdxIndex].ReferencedBy = append(target.Indexes[targetIdxIndex].ReferencedBy, backref)
+	} else {
+		target.PrimaryIndex.ReferencedBy = append(target.PrimaryIndex.ReferencedBy, backref)
+	}
 	return nil
 }
 

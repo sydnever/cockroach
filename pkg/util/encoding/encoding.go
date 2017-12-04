@@ -1045,8 +1045,20 @@ func PrettyPrintValue(valDirs []Direction, b []byte, sep string) string {
 	if allDecoded {
 		return s1
 	}
-	if s2, allDecoded := prettyPrintValueImpl(valDirs, UndoPrefixEnd(b), sep); allDecoded {
-		return s2 + sep + "PrefixEnd"
+	if undoPrefixEnd, ok := UndoPrefixEnd(b); ok {
+		// When we UndoPrefixEnd, we may have lost a tail of 0xFFs. Try to add
+		// enough of them to get something decoded. This is best-effort, we have to stop
+		// somewhere.
+		cap := 20
+		if len(valDirs) > len(b) {
+			cap = len(valDirs) - len(b)
+		}
+		for i := 0; i < cap; i++ {
+			if s2, allDecoded := prettyPrintValueImpl(valDirs, undoPrefixEnd, sep); allDecoded {
+				return s2 + sep + "PrefixEnd"
+			}
+			undoPrefixEnd = append(undoPrefixEnd, 0xFF)
+		}
 	}
 	return s1
 }
@@ -1110,13 +1122,16 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 		b, _ = DecodeIfNull(b)
 		return b, "NULL", nil
 	case NotNull:
+		// The tag can be either encodedNotNull or encodedNotNullDesc. The
+		// latter can be an interleaved sentinel.
+		isNotNullDesc := (b[0] == encodedNotNullDesc)
 		b, _ = DecodeIfNotNull(b)
-		if dir == Ascending || dir == Descending {
-			return b, "!NULL", nil
+		if dir != Ascending && dir != Descending && isNotNullDesc {
+			// Unspecified direction (0 value) will default to '#' for the
+			// interleaved sentinel.
+			return b, "#", nil
 		}
-		// Unspecified direction (0 value) will default to '#' for the
-		// interleaved sentinel.
-		return b, "#", nil
+		return b, "!NULL", nil
 	case Int:
 		var i int64
 		if dir == Descending {
@@ -1202,6 +1217,16 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 
 // UndoPrefixEnd is a partial inverse for roachpb.Key.PrefixEnd.
 //
+// In general, we can't undo PrefixEnd because it is lossy; we don't know how
+// many FFs were stripped from the original key. For example:
+//   - key:            01 02 03 FF FF
+//   - PrefixEnd:      01 02 04
+//   - UndoPrefixEnd:  01 02 03
+//
+// Some keys are not possible results of PrefixEnd; in particular, PrefixEnd
+// keys never end in 00. If an impossible key is passed, the second return value
+// is false.
+//
 // Specifically, calling UndoPrefixEnd will reverse the effects of calling a
 // PrefixEnd on a byte sequence, except when the byte sequence represents a
 // maximal prefix (i.e., 0xff...). This is because PrefixEnd is a lossy
@@ -1221,18 +1246,14 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 //
 // UndoPrefixEnd is implemented here to avoid a circular dependency on roachpb,
 // but arguably belongs in a byte-manipulation utility package.
-func UndoPrefixEnd(b []byte) []byte {
-	out := append([]byte(nil), b...)
-	for i := len(out) - 1; i >= 0; i-- {
-		out[i] = out[i] - 1
-		if out[i] != 0xff {
-			return out
-		}
+func UndoPrefixEnd(b []byte) (_ []byte, ok bool) {
+	if len(b) == 0 || b[len(b)-1] == 0 {
+		// Not a possible result of PrefixEnd.
+		return nil, false
 	}
-	// At this point, out has wrapped around to the maximal possible prefix. That
-	// means we were provided a minimal prefix (i.e., all zero bytes), so return
-	// it unchanged.
-	return b
+	out := append([]byte(nil), b...)
+	out[len(out)-1]--
+	return out, true
 }
 
 // NonsortingVarintMaxLen is the maximum length of an EncodeNonsortingVarint
